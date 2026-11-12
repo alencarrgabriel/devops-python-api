@@ -1,0 +1,144 @@
+name: Deploy EC2
+
+on:
+  push:
+    branches: [main]      # merge de PR na main = push na main
+  workflow_dispatch:      # permite rodar manualmente pela aba Actions
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-producao
+  cancel-in-progress: false   # nunca interrompe um deploy no meio
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+  CONTAINER_NAME: devops-python-api
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ---------------------------------------------------------------- 1. TESTES
+  test:
+    name: Testes automatizados
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obter o código
+        uses: actions/checkout@v6
+
+      - name: Preparar o Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: .python-version
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Instalar dependências
+        run: python -m pip install --requirement requirements-dev.txt
+
+      - name: Executar testes
+        run: pytest
+
+  # ------------------------------------------------ 2. BUILD + PUSH PARA O ECR
+  publish:
+    name: Build e publicação no ECR
+    needs: test                     # se os testes falharem, nada daqui pra baixo roda
+    runs-on: ubuntu-latest
+    steps:
+      - name: Obter o código
+        uses: actions/checkout@v6
+
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}   # obrigatório no AWS Academy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login no Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Construir e enviar a imagem
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker build --tag "$IMAGE" .
+          docker push "$IMAGE"
+          echo "Imagem publicada: $IMAGE" >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------- 3. DEPLOY NA EC2
+  deploy:
+    name: Deploy na EC2
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configurar credenciais AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Obter endereço do ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Preparar chave SSH
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/ec2.pem
+          chmod 600 ~/.ssh/ec2.pem
+          ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
+
+      - name: Atualizar o container na EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          # O bloco abaixo é executado DENTRO da EC2.
+          # As variáveis $... são substituídas aqui no runner antes do envio.
+          ssh -i ~/.ssh/ec2.pem "$EC2_USER@$EC2_HOST" 'bash -s' <<EOF
+          set -euo pipefail
+          echo ">> Login do Docker no ECR (credenciais vêm da IAM Role da instância)"
+          aws ecr get-login-password --region $AWS_REGION \
+            | docker login --username AWS --password-stdin $REGISTRY
+          echo ">> Baixando $IMAGE"
+          docker pull $IMAGE
+          echo ">> Substituindo o container anterior"
+          docker rm --force $CONTAINER_NAME 2>/dev/null || true
+          docker run --detach \
+            --name $CONTAINER_NAME \
+            --restart unless-stopped \
+            --publish 80:8000 \
+            $IMAGE
+          echo ">> Limpando imagens antigas"
+          docker image prune --all --force
+          EOF
+
+      - name: Verificar se o container está em execução
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/ec2.pem "$EC2_USER@$EC2_HOST" \
+            "docker ps --filter name=^${CONTAINER_NAME}\$ --filter status=running --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'"
+          ssh -i ~/.ssh/ec2.pem "$EC2_USER@$EC2_HOST" \
+            "docker ps -q --filter name=^${CONTAINER_NAME}\$ --filter status=running | grep -q ."
+
+      - name: Verificar a API publicada
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          curl --fail --silent --show-error \
+               --retry 10 --retry-delay 3 --retry-all-errors \
+               "http://$EC2_HOST/health"
